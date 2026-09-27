@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Order #{{ order.pk }}{% endblock %}
+{% block content %}
+  <h1>Order #{{ order.pk }} for {{ order.customer.email }}</h1>
+  <p>Status: {{ order.get_status_display }}</p>
+  <p>Total: {{ total }}</p>
+  <p>Refunded so far: {{ order.refunded_total }}</p>
+  <form method="post" action="{% url 'shop:refund_order' order.pk %}">
+    {% csrf_token %}
+    {% for line in order.lines.all %}
+      <label><input type="checkbox" name="line_ids" value="{{ line.pk }}"> {{ line.sku }} x {{ line.quantity }}</label>
+    {% endfor %}
+    <button type="submit">Refund selected lines</button>
+  </form>
+{% endblock %}

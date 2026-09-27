@@ -1,0 +1,8 @@
+<!doctype html>
+<html>
+  <head><title>{% block title %}Tinyshop{% endblock %}</title></head>
+  <body>
+    <nav><a href="{% url 'shop:order_list' %}">Orders</a></nav>
+    {% block content %}{% endblock %}
+  </body>
+</html>
