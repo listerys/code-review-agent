@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from pathlib import Path
 
+import openai
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from ..agent.orchestrator import Reviewer, ReviewFailed, ReviewOptions
+from ..agent.report import render_markdown, render_terminal
+from ..config import load_settings
 from ..demo import FEATURE_BRANCH, INJECTED_BUGS, create_demo_repo
+from ..evals.findings import run_demo_eval, run_findings_eval, save_findings_report
 from ..evals.golden import load_cases, mine_cases
 from ..evals.retrieval import ABLATIONS, run_retrieval_eval, save_report
 from ..git.repo import GitRepo
@@ -22,8 +28,8 @@ from ..session import ReviewSession
 from ..tools.executor import ToolCall, ToolExecutor
 from ..tools.impl import build_registry
 
-app = typer.Typer(no_args_is_help=True, add_completion=False, help="Repository intelligence and hybrid retrieval for code review agents.")
-eval_app = typer.Typer(no_args_is_help=True, help="Golden-set mining and retrieval evaluation.")
+app = typer.Typer(no_args_is_help=True, add_completion=False, help="AI code review for Python/Django branches, built on repository intelligence and hybrid retrieval.")
+eval_app = typer.Typer(no_args_is_help=True, help="Golden-set mining, retrieval evaluation, and review-quality evaluation.")
 demo_app = typer.Typer(no_args_is_help=True, help="Create the tinyshop demo repository.")
 app.add_typer(eval_app, name="eval")
 app.add_typer(demo_app, name="demo")
@@ -50,6 +56,46 @@ def print_usage(llm: LLMClient | None) -> None:
         f"[bold]LLM usage[/bold]: {totals.calls} calls, {totals.input_tokens:,} input tokens "
         f"({totals.cached_tokens:,} cached), {totals.output_tokens:,} output tokens, ${totals.cost_usd:.4f}"
     )
+
+
+NO_KEY_MESSAGE = "[red]OPENAI_API_KEY is not set: reviews need a model. Export it and run again.[/red]"
+
+
+@app.command()
+def run(
+    repo: str = RepoOption,
+    base: str = BaseOption,
+    head: str = HeadOption,
+    profile: list[str] = typer.Option(None, "--profile", "-p", help=f"Specialists to run (default: all of {', '.join(PROFILES)})"),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="Re-check candidate findings with the verifier agent"),
+    json_out: Path = typer.Option(None, "--json", help="Write the full report as JSON"),
+    markdown_out: Path = typer.Option(None, "--markdown", help="Write the report as Markdown"),
+):
+    """Review the branch diff with specialist agents and a verifier."""
+    profiles = profile or list(PROFILES)
+    unknown = [name for name in profiles if name not in PROFILES]
+    if unknown:
+        console.print(f"[red]unknown profile {', '.join(unknown)}; choose from {', '.join(PROFILES)}[/red]")
+        raise typer.Exit(2)
+    if not settings_for_repo(GitRepo(repo), head, use_llm=True).llm_enabled:
+        console.print(NO_KEY_MESSAGE)
+        raise typer.Exit(2)
+    session = open_session(repo, base, head, True)
+    if not session.engine.dense_available():
+        console.print("[yellow]no embeddings for this revision: run `review index` first to add dense retrieval[/yellow]")
+    try:
+        report = Reviewer(session, progress).run(ReviewOptions(profiles=profiles, verify=verify))
+    except (ReviewFailed, openai.APIError) as error:
+        console.print(f"[red]review failed: {error}[/red]")
+        raise typer.Exit(1)
+    render_terminal(report, console)
+    if json_out:
+        json_out.write_text(report.model_dump_json(indent=2))
+        console.print(f"wrote {json_out}")
+    if markdown_out:
+        markdown_out.write_text(render_markdown(report))
+        console.print(f"wrote {markdown_out}")
+    print_usage(session.llm)
 
 
 @app.command()
@@ -352,6 +398,73 @@ def eval_retrieval(
     console.print(f"report: {path}")
 
 
+@eval_app.command("demo")
+def eval_demo(enrich: bool = typer.Option(False, "--enrich", help="Summarize and embed the demo repository first")):
+    """Review the tinyshop demo and check that every injected bug is caught without the planted false alarm."""
+    if not load_settings(None, use_llm=True).llm_enabled:
+        console.print(NO_KEY_MESSAGE)
+        raise typer.Exit(2)
+    with tempfile.TemporaryDirectory() as workdir:
+        try:
+            report, score = run_demo_eval(Path(workdir), enrich, progress)
+        except (ReviewFailed, openai.APIError) as error:
+            console.print(f"[red]review failed: {error}[/red]")
+            raise typer.Exit(1)
+    render_terminal(report, console)
+    table = Table(title="Demo score")
+    table.add_column("result")
+    table.add_column("finding")
+    for label in score.caught:
+        table.add_row("[green]caught[/green]", label)
+    for label in score.missed:
+        table.add_row("[red]missed[/red]", label)
+    for label in score.false_alarms:
+        table.add_row("[red]false alarm[/red]", label)
+    for label in score.extra:
+        table.add_row("[yellow]extra[/yellow]", label)
+    console.print(table)
+    console.print(f"{len(score.caught)}/{len(INJECTED_BUGS)} injected bugs caught, {len(score.false_alarms)} false alarms; ${report.cost_usd:.4f}")
+    if not score.passed:
+        raise typer.Exit(1)
+
+
+@eval_app.command("findings")
+def eval_findings(
+    repo: str = RepoOption,
+    case: list[str] = typer.Option(None, "--case", help="Limit to case ids"),
+):
+    """Run full reviews on golden cases and score findings against the known bug locations."""
+    git_repo = GitRepo(repo)
+    settings = settings_for_repo(git_repo, use_llm=True)
+    if not settings.llm_enabled:
+        console.print(NO_KEY_MESSAGE)
+        raise typer.Exit(2)
+    cache_dir = repo_cache_dir(git_repo, settings)
+    cases = [item for item in load_cases(cache_dir, case or None) if item.expected_findings]
+    if not cases:
+        console.print("[red]no golden cases with expected findings; run `review eval mine` first[/red]")
+        raise typer.Exit(1)
+    report = run_findings_eval(git_repo, settings, open_store(git_repo, settings), cases, progress)
+    path = save_findings_report(cache_dir, report)
+    table = Table(title=f"Findings eval: {len(report.results)} cases")
+    for column in ("case", "subject", "expected", "caught", "findings", "on target", "cost"):
+        table.add_column(column)
+    for result in report.results:
+        subject = result.subject[:50] + (f" [red]({result.error[:40]})[/red]" if result.error else "")
+        table.add_row(
+            result.case_id,
+            subject,
+            str(result.expected),
+            str(result.matched_expected),
+            str(result.findings),
+            str(result.matched_findings),
+            f"${result.cost_usd:.4f}",
+        )
+    console.print(table)
+    console.print(f"recall {report.recall:.3f} · precision {report.precision:.3f} (findings away from the fixed lines count against precision)")
+    console.print(f"report: {path}")
+
+
 @demo_app.command("create")
 def demo_create(path: Path = typer.Argument(..., help="Empty directory to create the demo repository in")):
     target = create_demo_repo(path)
@@ -363,7 +476,7 @@ def demo_create(path: Path = typer.Argument(..., help="Empty directory to create
     for bug in INJECTED_BUGS:
         table.add_row(bug["path"], bug["category"], bug["summary"])
     console.print(table)
-    console.print(f"try: review index -r {target} --base main --no-llm && review context -r {target} --base main -p state_regression")
+    console.print(f"try: review run -r {target} --base main   (or without a key: review context -r {target} --base main -p state_regression --no-llm)")
 
 
 if __name__ == "__main__":

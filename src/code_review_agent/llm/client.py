@@ -53,6 +53,14 @@ def strict_text_format(schema: type[BaseModel]) -> dict:
     return type_to_text_format_param(schema)
 
 
+def scrub_input_item(item: dict) -> dict:
+    if item.get("type") == "function_call_output":
+        return dict(item, output=scrub(item["output"]))
+    if item.get("role") == "user" and isinstance(item.get("content"), str):
+        return dict(item, content=scrub(item["content"]))
+    return item
+
+
 class LLMClient:
     def __init__(self, settings: Settings, store=None, http_client=None):
         if not settings.openai_api_key:
@@ -168,6 +176,28 @@ class LLMClient:
         if parsed is None:
             raise ValueError("model returned no structured output")
         return parsed
+
+    def agent_turn(self, instructions: str, items: list[dict], tools: list[dict], schema: type[BaseModel], purpose: str, allow_tools: bool = True):
+        model = self.settings.models.review_model
+        arguments = {
+            "model": model,
+            "instructions": scrub(instructions),
+            "input": [scrub_input_item(item) for item in items],
+            "tools": tools,
+            "tool_choice": "auto" if allow_tools else "none",
+            "text": {"format": strict_text_format(schema)},
+            "store": False,
+        }
+        if is_reasoning_model(model):
+            arguments["reasoning"] = {"effort": self.settings.models.review_reasoning_effort}
+            arguments["include"] = ["reasoning.encrypted_content"]
+        response = self.client.responses.create(**arguments)
+        usage = response.usage
+        cached = 0
+        if usage is not None and usage.input_tokens_details is not None:
+            cached = usage.input_tokens_details.cached_tokens or 0
+        self.record(purpose, response.model or model, usage.input_tokens if usage else 0, cached, usage.output_tokens if usage else 0)
+        return response
 
     def structured_request_body(self, schema: type[BaseModel], instructions: str, prompt: str, model: str | None = None) -> dict:
         model = model or self.settings.models.mini_model

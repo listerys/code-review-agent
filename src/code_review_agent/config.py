@@ -14,6 +14,7 @@ class ModelPrice(BaseModel):
 
 
 DEFAULT_PRICES = {
+    "gpt-5": ModelPrice(input_per_million=1.25, cached_input_per_million=0.125, output_per_million=10.0),
     "gpt-5-mini": ModelPrice(input_per_million=0.25, cached_input_per_million=0.025, output_per_million=2.0),
     "gpt-4.1-mini": ModelPrice(input_per_million=0.40, cached_input_per_million=0.10, output_per_million=1.60),
     "text-embedding-3-large": ModelPrice(input_per_million=0.13),
@@ -54,6 +55,8 @@ class ModelSettings(BaseModel):
     timeout_seconds: float = 90.0
     summary_batch_size: int = 12
     embedding_batch_size: int = 256
+    review_model: str = "gpt-5"
+    review_reasoning_effort: str = "medium"
 
 
 class RetrievalSettings(BaseModel):
@@ -75,6 +78,14 @@ class ToolSettings(BaseModel):
     read_file_max_lines: int = 250
 
 
+class AgentSettings(BaseModel):
+    specialist_max_turns: int = 12
+    verifier_max_turns: int = 16
+    verifier_batch_size: int = 10
+    max_review_cost_usd: float = 2.0
+    diff_prompt_tokens: int = 6000
+
+
 class Settings(BaseModel):
     cache_root: Path
     openai_api_key: str | None = None
@@ -85,6 +96,7 @@ class Settings(BaseModel):
     models: ModelSettings = Field(default_factory=ModelSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     tools: ToolSettings = Field(default_factory=ToolSettings)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
     prices: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_PRICES))
 
     @property
@@ -135,6 +147,8 @@ def load_settings(repo_config_text: str | None = None, use_llm: bool = True) -> 
     models = data.setdefault("models", {})
     if os.environ.get("CRA_MINI_MODEL"):
         models["mini_model"] = os.environ["CRA_MINI_MODEL"]
+    if os.environ.get("CRA_REVIEW_MODEL"):
+        models["review_model"] = os.environ["CRA_REVIEW_MODEL"]
     if os.environ.get("CRA_EMBEDDING_MODEL"):
         models["embedding_model"] = os.environ["CRA_EMBEDDING_MODEL"]
     if os.environ.get("CRA_EMBEDDING_DIMS"):
