@@ -37,6 +37,7 @@ NOT_A_BUG = [
     {
         "path": "shop/services/refunds.py",
         "summary": "invalidate_order_total was removed, but the Refund and Order post_save receivers still invalidate the cache",
+        "terms": ["invalidate_order_total", "cache"],
     }
 ]
 

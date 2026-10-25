@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -26,6 +27,8 @@ class FakeOpenAI:
     def __init__(self, fail_models: set[str] | None = None):
         self.requests: list[dict] = []
         self.fail_models = fail_models or set()
+        self.agent_policy = None
+        self.turn_numbers = itertools.count(1)
 
     def usage(self, input_tokens: int = 100, output_tokens: int = 20) -> dict:
         return {
@@ -36,22 +39,42 @@ class FakeOpenAI:
             "output_tokens_details": {"reasoning_tokens": 0},
         }
 
-    def response(self, model: str, payload: dict) -> dict:
+    def message(self, payload: dict) -> dict:
+        return {
+            "type": "message",
+            "id": "msg_test",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": json.dumps(payload), "annotations": []}],
+        }
+
+    def agent_output(self, body: dict) -> list[dict]:
+        turn = next(self.turn_numbers)
+        decision = self.agent_policy(body)
+        output = [{"type": "reasoning", "id": f"rs_{turn}", "summary": [], "encrypted_content": f"encrypted-{turn}"}]
+        if "calls" not in decision:
+            return output + [self.message(decision["final"])]
+        for index, (name, arguments) in enumerate(decision["calls"]):
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": f"fc_{turn}_{index}",
+                    "call_id": f"call_{turn}_{index}",
+                    "name": name,
+                    "arguments": json.dumps(arguments),
+                    "status": "completed",
+                }
+            )
+        return output
+
+    def response(self, model: str, payload: dict, output: list[dict] | None = None) -> dict:
         return {
             "id": "resp_test",
             "object": "response",
             "created_at": 1,
             "status": "completed",
             "model": model,
-            "output": [
-                {
-                    "type": "message",
-                    "id": "msg_test",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": json.dumps(payload), "annotations": []}],
-                }
-            ],
+            "output": output if output is not None else [self.message(payload)],
             "parallel_tool_calls": True,
             "tool_choice": "auto",
             "tools": [],
@@ -94,6 +117,8 @@ class FakeOpenAI:
                 200,
                 json={"object": "list", "data": data, "model": model, "usage": {"prompt_tokens": 10 * len(inputs), "total_tokens": 10 * len(inputs)}},
             )
+        if request.url.path.endswith("/responses") and "tools" in body:
+            return httpx2.Response(200, json=self.response(f"{model}-2026-01-01", {}, self.agent_output(body)))
         if request.url.path.endswith("/responses"):
             schema_name = body["text"]["format"]["name"]
             payload = self.structured_payload(schema_name, body["input"])
